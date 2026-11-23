@@ -13,6 +13,8 @@ _CENTRAL_HEADER = struct.Struct("<4s6H3I5H2I")
 _LOCAL_HEADER = struct.Struct("<4s5H3I2H")
 _ZIP64_LOCATOR = struct.Struct("<4sIQI")
 _ZIP64_END_RECORD = struct.Struct("<4sQ2H2I4Q")
+# Bytes of the ZIP64 end record after its 12-byte signature+size header.
+_ZIP64_END_RECORD_FIXED_REMAINDER = _ZIP64_END_RECORD.size - 12
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,8 @@ class _Directory:
     end: int
     entries: int
     prefix_size: int
+    # (record position, extensible data start, extensible data end) of the ZIP64 end record.
+    extensible_data: tuple[int, int, int] | None = None
 
 
 def _locate_directory(content: bytes) -> _Directory:
@@ -54,9 +58,16 @@ def _locate_directory(content: bytes) -> _Directory:
             or offset + size != record_offset
         ):
             raise zipfile.BadZipFile("Invalid ZIP64 end record")
+        extensible_data = (
+            (record_position, record_position + _ZIP64_END_RECORD.size, locator_position)
+            if record_size > _ZIP64_END_RECORD_FIXED_REMAINDER
+            else None
+        )
         end = record_position
     elif entries == 0xFFFF or size == 0xFFFFFFFF or offset == 0xFFFFFFFF:
         raise zipfile.BadZipFile("Missing ZIP64 directory information")
+    else:
+        extensible_data = None
 
     start = end - size
     prefix_size = start - offset
@@ -64,7 +75,7 @@ def _locate_directory(content: bytes) -> _Directory:
         raise zipfile.BadZipFile("Multi-disk ZIP archives are not supported")
     if start < 0 or prefix_size < 0 or entries > size // _CENTRAL_HEADER.size:
         raise zipfile.BadZipFile("Invalid ZIP directory bounds")
-    return _Directory(start=start, end=end, entries=entries, prefix_size=prefix_size)
+    return _Directory(start=start, end=end, entries=entries, prefix_size=prefix_size, extensible_data=extensible_data)
 
 
 def _local_header_offset(*, offset: int, file_size: int, compressed_size: int, extra: bytes) -> int:
@@ -90,20 +101,27 @@ def _local_header_offset(*, offset: int, file_size: int, compressed_size: int, e
 def open_zip_with_replacement_names(content: bytes) -> zipfile.ZipFile:
     """Open a bounded ZIP, replacing invalid UTF-8 name bytes with U+FFFD.
 
-    The normal path delegates entirely to zipfile. For a damaged directory,
-    temporarily read affected names as CP437 (a reversible byte mapping), and
-    expose their lossy UTF-8 form through ZipInfo.filename. orig_filename stays
-    byte-preserving so zipfile still checks local/central name consistency.
-    Callers must reject collisions and unsafe paths in the recovered names.
+    The normal path delegates entirely to zipfile. For a ZIP64 end record carrying
+    extensible data, CPython cannot locate the directory, so the record's optional
+    extension is dropped (it holds no archive payload) before the archive is
+    reopened. For a damaged directory, temporarily read affected names as CP437 (a
+    reversible byte mapping), and expose their lossy UTF-8 form through
+    ZipInfo.filename. orig_filename stays byte-preserving so zipfile still checks
+    local/central name consistency. Callers must reject collisions and unsafe paths
+    in the recovered names.
     """
     try:
         return zipfile.ZipFile(io.BytesIO(content))
-    except UnicodeDecodeError:
+    except (UnicodeDecodeError, zipfile.BadZipFile):
         pass
 
     directory = _locate_directory(content)
 
     patched = bytearray(content)
+    if directory.extensible_data is not None:
+        record_position, extension_start, extension_end = directory.extensible_data
+        del patched[extension_start:extension_end]
+        struct.pack_into("<Q", patched, record_position + 4, _ZIP64_END_RECORD_FIXED_REMAINDER)
     recovered: dict[int, str] = {}
     cursor = directory.start
     for index in range(directory.entries):
